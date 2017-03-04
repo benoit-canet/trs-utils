@@ -1,0 +1,268 @@
+#!/usr/bin/python
+# -*- coding: utf-8 -*-
+#
+# Copyright 2016 Peter Howard <pjh@northern-ridge.com.au>
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+"""
+Process a wav file containing a 500-baud TRS80 cassette image.  The encoding
+requires ms-pulses.  1 sync pulse, and a second pulse for 1, or no pulse for 0.
+
+Refer to the Chronogram in cas2wav-low for a longer description of the
+waveform.
+
+Operational sequence:
+
+ - Scan and locate initial sync pulse (confirming there is another pulse 2ms
+   later).
+ - Once found, process 2ms blocks as 1 or 0 and compile a bytestream,
+   most significant bit first.
+
+Note: This is still a 'work in progress' - ymmv depending on the audio quality
+of a specific program.
+
+"""
+
+from __future__ import print_function
+
+import argparse
+import operator
+import struct
+import wave
+import os
+
+
+class WavDetails(object):
+    """
+    Holds configuration values based on the read file.
+    """
+
+    def __init__(self, args, channels, sampwidth, framerate, nframes, _1, _2):
+        """
+        Note: Ignore compression params
+        """
+
+        self.VERBOSE = args.verbose
+        self.DEBUG = args.debug
+        self.LOW = args.low
+
+        if self.VERBOSE is True:
+            print("\tchannels {}\n\tsampwidth {}\n\tframerate {}\n\tframes {}".format(channels, sampwidth, framerate, nframes))
+
+        self.nframes = nframes
+        self.sampwidth = sampwidth
+
+        # Note: 8-bit is unsigned, 16 and 32-bit is signed.
+        if sampwidth == 1:
+            self.samp_char = 'B'
+            self.neutral = 127
+            self.min_1 = 0
+            self.max_1 = 255
+
+        elif sampwidth == 2:
+            self.samp_char = 'h'
+            self.neutral = 0
+            self.min_1 = -32767
+            self.max_1 = 32767
+        else:
+            self.samp_char = 'i'
+
+        self.hz = 1000
+        self.framerate = framerate
+        self.bytes_per_sec = self.framerate * self.sampwidth
+        self.period = self.framerate / self.hz
+        self.half_strobe = self.period / 8
+        self.silence = self.period - (self.half_strobe * 2)
+
+        # Note: these "acceptable error" values were worked out empirically
+        # from a relatively poor tape.  They may, however, not cover every
+        # case that works for the real hardware.
+        self.max_p_p = self.half_strobe * 3
+        self.delta = (self.max_1 - self.neutral) / 8
+
+        if self.DEBUG is True:
+            print("Neutral {} max {} min {} delta {}".format(self.neutral,
+                                                             self.max_1,
+                                                             self.min_1,
+                                                             self.delta))
+def align_strobe(conf, wf, index, first=False):
+    """Given an index for a "high" value, try to align to the correct start
+    point of the strobe.
+
+    Given it is the timing "high" value, search forward from there to find the
+    corresponding "low".  Normally an upward and downard pulse of at least 50%
+    is required to count.  However if LOW is set, the strength of the downward
+    pulse alone is checked.
+
+    If first is True, then check for a subsequent sync bit 2ms later, courtesy
+    of a recursive call.
+    """
+
+    wf.setpos(index)
+    sset = struct.unpack(conf.samp_char * (conf.half_strobe * 3),
+                        wf.readframes(conf.half_strobe * 3))
+    if conf.DEBUG:
+        print(sset)
+
+    max_index, max_value = max(enumerate(sset), key=operator.itemgetter(1))
+    min_index, min_value = min(enumerate(sset), key=operator.itemgetter(1))
+    if conf.DEBUG:
+        print("Found max value {} at element {}, min value {} at element {}".format\
+              (max_value, max_index, min_value, min_index))
+
+    #
+    # Some sanity checks ranging from basic to slightly-less-basic.
+    #
+    if (min_index - max_index) > (conf.max_p_p):
+        print("Max legal space {} had {}".format(conf.max_p_p, min_index - max_index))
+        return None
+
+    if (min_value > conf.neutral) or (max_value < conf.neutral):
+        return None
+
+    valid = (min_value < (conf.neutral - conf.delta))
+    if conf.LOW is not True:
+        valid = valid and \
+                (max_value > (conf.neutral + conf.delta))
+
+    if valid is not True:
+        return None
+
+    if first is False:
+        return index + max_index
+    else:
+        if conf.DEBUG:
+            print("Jump 2ms")
+
+        if align_strobe(conf, wf, index + (conf.period * 2), False) is None:
+            return None
+        else:
+            return index + max_index
+
+def find_first_sync_pulse(wf, conf):
+    """
+    Go through file from front, finding initial sync pulse.  Return
+    Index of start of pulse.
+
+    Detection is fairly generous, treating any rise >= 25% as a possible
+    pulse
+    """
+
+    sc = 0
+
+    while True:
+        try:
+            b = struct.unpack(conf.samp_char * conf.period,
+                              wf.readframes(conf.period))
+            c = 0
+            for smp in b:
+                if smp > (conf.neutral + ((conf.max_1 - conf.neutral)/ 4)):
+                    print("Found upward spike of {} at {}".format(smp, sc + c))
+                    str_start =  align_strobe(conf, wf, sc + c, True)
+                    if str_start is not None:
+                        if conf.DEBUG:
+                            print("Sync strobe found")
+                        return str_start
+                c += 1
+            sc += conf.period
+        except:
+            # Only reason to get here is because we read to end of file
+            # without finding a pulse.
+            return None
+
+def decode_file(wf, of, conf, first_sync):
+    """
+    Decode file as bitstream, with index of first sync pulse provided
+    """
+
+    lbi = 0
+    cbi = first_sync
+    byte = 0
+    bc = 0
+    try:
+        while True:
+            idx = align_strobe(conf,
+                               wf,
+                               cbi + conf.period - (conf.half_strobe / 2))
+            if idx is not None:
+                bit = 1
+            else:
+                bit = 0
+            byte <<= 1
+            byte += bit
+            if (bc == 7):
+                if conf.VERBOSE:
+                    print("{:x}".format(byte))
+                of.write(chr(byte))
+                byte = 0
+                bc = 0
+            else:
+                bc += 1
+            lbi = cbi
+            cbi = align_strobe(conf,
+                               wf,
+                               cbi + (conf.period * 2) - (conf.half_strobe / 2))
+    except:
+        pass
+
+    if conf.DEBUG:
+            print("Last strobe at {} of {} - {} leftover".format \
+                  (lbi, conf.nframes, conf.nframes - lbi))
+
+def main():
+    """
+    Process arguments, open file, and set off conversion.
+    """
+
+    parser = argparse.ArgumentParser(prog='wav2cas-low',
+                                     description='Convert wav file to CASS')
+    parser.add_argument('-v',
+                        '--verbose',
+                        help="Informational Output",
+                        action='store_true')
+    parser.add_argument('-D',
+                        '--debug',
+                        help="Used for debugging the program; not recommended for a normal user",
+                        action='store_true')
+    parser.add_argument('-l',
+                        '--low',
+                        help="Low part of pulse alone is amplitude-tested",
+                        action='store_true')
+    parser.add_argument('-o',
+                        '--outfile',
+                        help="Filename to save output (based on intput file if not specified",
+                        type=str)
+    parser.add_argument('wf',
+                        metavar='FILE',
+                        help="File to convert",
+                        type=str)
+
+    args = parser.parse_args()
+
+    wf = wave.open(args.wf, 'rb')
+    params = wf.getparams()
+    conf = WavDetails(args, *params)
+    outfile = args.outfile if args.outfile else  args.wf.split('.')[0] + ".cas"
+    with open(outfile, 'wb') as of:
+        first_sync = find_first_sync_pulse(wf, conf)
+        if first_sync is not None:
+            print("Found initial sync strobe at sample {}".format(first_sync))
+            decode_file(wf, of, conf, first_sync)
+        else:
+            print("Could not find initial sync")
+
+    wf.close()
+
+if __name__ == '__main__':
+    main()

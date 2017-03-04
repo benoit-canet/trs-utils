@@ -38,9 +38,11 @@ Synchro bit n                Data bit n                      Synchro bit n + 1
 t1 = t2 = 125 us
 t3 = 750 us
 
-bytes most signifiant bits transfered first """
+bytes most signifiant bits transfered first
 
-from optparse import OptionParser
+"""
+
+import argparse
 import struct
 import os
 
@@ -91,7 +93,10 @@ def output_byte(out, byte):
         byte <<= 1
 
 def convert_to_wav(out, cass):
-    """ Output the byte stream in cass to a wav data chunk in out """
+    """
+    Output the byte stream in cass to a wav data chunk in out.
+    """
+
     char = cass.read(1)
     while char != "":
         output_byte(out, ord(char))
@@ -99,25 +104,25 @@ def convert_to_wav(out, cass):
 
 def main():
     """ Main """
-    usage = "usage: %prog -o file.wav file.cass"
-    parser = OptionParser(usage=usage)
-    parser.add_option('-o', dest='wav', help='Output WAV file name',
-                      metavar='CASS', default='/dev/stdout')
-    (options, args) = parser.parse_args()
+    desc = 'Convert low-baudrate cas file to wav file'
+    parser = argparse.ArgumentParser(prog='cas2wav-low',
+                                     description=desc)
+    parser.add_argument('-o',
+                        '--outfile',
+                        help="Output WAV file name (defaults to stdout)",
+                        type=str,
+                        default='/dev/stdout')
+    parser.add_argument('casfile',
+                        metavar='FILE',
+                        help="CAS file to convert",
+                        type=str)
+    args = parser.parse_args()
 
-    if len(args) != 1:
-        exit("Missing input .cass file.")
+    with open(args.casfile, 'rb') as cass, open(args.outfile, 'wb') as out:
 
-    cass = open(args[0], "r")
-    out = open(options.wav, "wb")
+        output_wav_headers(out, os.path.getsize(args.casfile))
+        convert_to_wav(out, cass)
 
-    output_wav_headers(out, os.path.getsize(args[0]))
-
-    convert_to_wav(out, cass)
-
-    cass.close()
-    out.flush()
-    out.close()
 
 if __name__ == "__main__":
     main()
