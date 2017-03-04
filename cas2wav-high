@@ -1,0 +1,145 @@
+#!/usr/bin/python
+# -*- coding: utf-8 -*-
+#
+# Copyright 2016 Peter Howard <pjh@northern-ridge.com.au>
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+"""
+Output a TRS-80 cas file into a wav file using the high speed modulation format.
+
+Note that the high-speed cas file is a different format from the low-speed cas
+file, so make sure you are converting from the right format - this utility
+does bit-by-bit conversion without attempting to interpret the contents.  For
+low-speed (i.e. 500 baud) the use of the synchronisation bit is not
+reperesented in the .cas file.  For high-speed, there is an extra bit inserted
+at the beginning of each byte.  But, because it is done only _after_ the
+initial 7F start identifier (as opposed to the A5 start identifier in
+low-speed files) the bit is represented in the .cas file itself.
+
+The waveform for a high-speed program is roughly "Audio Frequency Shift Keyed"
+or Audio FSK.
+
+Chronogram:
+
+       |    1    |        0        |
+        ----      --------
+       |    |    |        |        |
+       |    |    |        |        |
+       |    |    |        |        |
+--|    |    |    |        |        |
+  |    |    |    |        |        |
+   ----     |    |        |        |
+            |    |        |        |
+             ----          --------
+
+The frequency for a 1 bit is 2600Hz giving a period of ~373us.  The frequency
+for a 0 bit is 1320Hz giving a period of ~757us.  This means the exact
+transfer rate is variable, and the "1500 baud" rating is an estimate.
+
+Because the Model 3/4 detects the crossing of zero (low-high) the level drops
+below zero just before the first bit is encoded.
+
+"""
+
+from __future__ import print_function
+
+import argparse
+import operator
+import struct
+import os
+import wave
+
+PCM_FORMAT = 1
+CHANNELS = 1
+FREQUENCY = 44100
+BYTES_PER_SAMPLE = 1
+ZERO_HZ = 1320
+ONE_HZ = 2680
+
+
+ZERO_PERIOD = FREQUENCY / ZERO_HZ
+ONE_PERIOD = FREQUENCY / ONE_HZ
+
+ZERO_HP = ZERO_PERIOD / 2 # 1/2 cycle
+ONE_HP = ONE_PERIOD / 2 # 1/2 cycle
+
+NEUTRAL = 127
+MIN = 0
+MAX = 255
+
+HMIN = NEUTRAL / 2
+HMAX = NEUTRAL + (MAX - NEUTRAL) / 2
+
+def bit_pulse(bit):
+    """ Output a 1 ms bit pulse """
+    if bit:
+        out = (chr(MAX) * ONE_HP) + (chr(MIN) * ONE_HP)
+    else:
+        out = (chr(MAX) * ZERO_HP) + (chr(MIN) * ZERO_HP)
+    return out
+
+def output_byte(byte):
+    """ Output a byte """
+    out = ''
+    for _ in range(8):
+        bit = (byte >> 7) & 0x1
+        out += bit_pulse(bit)
+        byte <<= 1
+    return out
+
+def convert_to_wav(out, cass):
+    """
+    Output the byte stream in cas to wavfile out.
+    """
+
+    output = (chr(NEUTRAL) * ZERO_PERIOD) + (chr(HMIN) * ZERO_PERIOD)
+    char = cass.read(1)
+    while char != "":
+        output += output_byte(ord(char))
+        char = cass.read(1)
+
+    out.writeframes(output)
+
+
+def main():
+    """ Main """
+    desc = 'Convert high-baudrate cas file to wav file'
+    parser = argparse.ArgumentParser(prog='cas2wav-high',
+                                     description=desc)
+    parser.add_argument('-o',
+                        '--outfile',
+                        help="Output WAV file name (defaults to stdout)",
+                        type=str,
+                        default='/dev/stdout')
+    parser.add_argument('casfile',
+                        metavar='FILE',
+                        help="CAS file to convert",
+                        type=str)
+    args = parser.parse_args()
+
+    with open(args.casfile, 'rb') as cass:
+        out = wave.open(args.outfile, 'w')
+
+        out.setparams((CHANNELS,
+                       BYTES_PER_SAMPLE,
+                       FREQUENCY,
+                       0,
+                       'NONE',
+                       'not compressed'))
+        convert_to_wav(out, cass)
+        out.close()
+
+
+if __name__ == "__main__":
+    main()
